@@ -24,11 +24,23 @@ function parseDate(v){
     let [_,dd,mm,yy]=m; dd=+dd; mm=+mm; yy=+yy;
     if(yy<100) yy+=2000;
     const d=new Date(yy,mm-1,dd);
-    return isNaN(d)?null:d;
+    return plausibleDate(d);
   }
   m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if(m){ const d=new Date(+m[1],+m[2]-1,+m[3]); return isNaN(d)?null:d; }
-  const d=new Date(s); return isNaN(d)?null:d;
+  if(m){ return plausibleDate(new Date(+m[1],+m[2]-1,+m[3])); }
+  const d=new Date(s); return plausibleDate(d);
+}
+// Rejeita datas impossíveis: inválidas, no futuro (depois de hoje)
+// ou antes de 2019 (antes da plataforma existir). Erros de digitação de ano
+// (ex.: 2028) deixam de distorcer gráficos e período.
+function plausibleDate(d){
+  if(!d || isNaN(d)) return null;
+  const hoje=new Date();
+  const limiteFuturo=new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate()); // hoje 00:00
+  const limitePassado=new Date(2019,0,1);
+  if(d > limiteFuturo) return null;   // data no futuro = erro de digitação
+  if(d < limitePassado) return null;  // antes de 2019 = suspeita
+  return d;
 }
 const ymKey = d => d ? `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}` : null;
 const ymLabel = k => {
