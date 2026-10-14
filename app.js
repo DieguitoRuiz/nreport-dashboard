@@ -40,6 +40,24 @@ const ymLabel = k => {
 const daysBetween = (a,b)=> (a&&b)? Math.round((b-a)/86400000) : null;
 const fmt = n => (n==null||isNaN(n))?'—':n.toLocaleString('pt-BR');
 
+/* ---------- conserto de acentos quebrados (mojibake de CSV Latin-1/UTF-8) ---------- */
+// Ex.: "Indicaç�" / "SÃ£o Paul" -> "Indicação" / "São Paulo" (quando possível)
+const MOJIBAKE_MAP = {
+  'Ã£':'ã','Ã¡':'á','Ã¢':'â','Ã ':'à','Ã©':'é','Ãª':'ê','Ã­':'í',
+  'Ã³':'ó','Ã´':'ô','Ãµ':'õ','Ãº':'ú','Ã§':'ç','Ã‰':'É','Ã“':'Ó',
+  'Ã‡':'Ç','Ãš':'Ú','Ã':'Á','Ã‚':'Â','Ãƒ':'Ã','Ã”':'Ô','Ã•':'Õ',
+  'Ã©':'é','Ã¨':'è'
+};
+function fixText(s){
+  if(s==null) return s;
+  let t=String(s);
+  // substitui sequências conhecidas de mojibake
+  for(const [bad,good] of Object.entries(MOJIBAKE_MAP)) t=t.split(bad).join(good);
+  // remove o caractere de substituição (�) usado quando o acento se perdeu
+  t=t.replace(/\uFFFD/g,'');
+  return t.trim();
+}
+
 /* ---------- detecção flexível de colunas ---------- */
 // mapeia o cabeçalho real -> campos canônicos (tolerante a acento/caixa)
 const FIELD_ALIASES = {
@@ -115,10 +133,10 @@ function normalizeRow(raw, cmap){
   const dLaudo=parseDate(g('dataPrimeiroLaudo'));
   const dAcesso=parseDate(g('ultimoAcesso'));
   const r={
-    nome:g('nome'), email:g('email'),
-    estado:(String(g('estado')||'').trim().toUpperCase()||'—'),
-    cidade:g('cidade'),
-    origem:(String(g('comoConheceu')||'').trim()||'—'),
+    nome:fixText(g('nome')), email:g('email'),
+    estado:(fixText(g('estado')).toUpperCase()||'—'),
+    cidade:fixText(g('cidade')),
+    origem:(fixText(g('comoConheceu'))||'—'),
     qtdLogin:+(g('qtdLogin')||0)||0,
     qtdLaudos:+(g('qtdLaudos')||0)||0,
     dataCadastro:dCad, dataAssinatura:dAss, dataCancelamento:dCanc,
