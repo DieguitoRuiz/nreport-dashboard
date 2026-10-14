@@ -1,473 +1,225 @@
-/* ============================================================
-   nReport Dashboard — lógica (100% client-side)
-   ============================================================ */
-
-'use strict';
-
-/* ---------- estado global ---------- */
-let RAW = [];        // linhas cruas (objetos) vindas da planilha
-let ROWS = [];       // linhas normalizadas
-let CHARTS = {};     // instâncias Chart.js (para destruir ao recarregar)
-
-/* ---------- utilitários de data ---------- */
-// Aceita DD/MM/AAAA, DD/MM/AA, AAAA-MM-DD e serial de Excel
-function parseDate(v){
-  if(v===null||v===undefined||v==='') return null;
-  if(v instanceof Date && !isNaN(v)) return v;
-  if(typeof v==='number'){ // serial do Excel
-    const d=XLSX.SSF ? XLSX.SSF.parse_date_code(v) : null;
-    if(d) return new Date(d.y, d.m-1, d.d);
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nReport • Painel de Métricas de Usuários</title>
+<!-- SheetJS: lê .xlsx e .csv localmente, sem enviar nada para servidor -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<!-- Chart.js: gráficos -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#171e2e; --panel2:#1e2638; --line:#2a344a;
+    --txt:#e8edf6; --muted:#9aa7bd; --accent:#4f8cff; --accent2:#2bd4a7;
+    --warn:#ffb020; --danger:#ff5d6c; --purple:#a98bff;
+    --radius:14px; --shadow:0 6px 24px rgba(0,0,0,.28);
   }
-  const s=String(v).trim();
-  let m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if(m){
-    let [_,dd,mm,yy]=m; dd=+dd; mm=+mm; yy=+yy;
-    if(yy<100) yy+=2000;
-    const d=new Date(yy,mm-1,dd);
-    return isNaN(d)?null:d;
-  }
-  m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if(m){ const d=new Date(+m[1],+m[2]-1,+m[3]); return isNaN(d)?null:d; }
-  const d=new Date(s); return isNaN(d)?null:d;
-}
-const ymKey = d => d ? `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}` : null;
-const ymLabel = k => {
-  if(!k) return '—';
-  const [y,m]=k.split('-');
-  const nomes=['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
-  return `${nomes[+m-1]}/${y}`;
-};
-const daysBetween = (a,b)=> (a&&b)? Math.round((b-a)/86400000) : null;
-const fmt = n => (n==null||isNaN(n))?'—':n.toLocaleString('pt-BR');
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:'Segoe UI',system-ui,-apple-system,Roboto,sans-serif;font-size:14px}
+  header{padding:20px 26px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px}
+  header h1{margin:0;font-size:19px;font-weight:700;letter-spacing:.3px}
+  header h1 span{color:var(--accent)}
+  .sub{color:var(--muted);font-size:12.5px;margin-top:3px}
+  .wrap{padding:22px 26px;max-width:1500px;margin:0 auto}
 
-/* ---------- conserto de acentos quebrados (mojibake de CSV Latin-1/UTF-8) ---------- */
-// Ex.: "Indicaç�" / "SÃ£o Paul" -> "Indicação" / "São Paulo" (quando possível)
-const MOJIBAKE_MAP = {
-  'Ã£':'ã','Ã¡':'á','Ã¢':'â','Ã ':'à','Ã©':'é','Ãª':'ê','Ã­':'í',
-  'Ã³':'ó','Ã´':'ô','Ãµ':'õ','Ãº':'ú','Ã§':'ç','Ã‰':'É','Ã“':'Ó',
-  'Ã‡':'Ç','Ãš':'Ú','Ã':'Á','Ã‚':'Â','Ãƒ':'Ã','Ã”':'Ô','Ã•':'Õ',
-  'Ã©':'é','Ã¨':'è'
-};
-function fixText(s){
-  if(s==null) return s;
-  let t=String(s);
-  // substitui sequências conhecidas de mojibake
-  for(const [bad,good] of Object.entries(MOJIBAKE_MAP)) t=t.split(bad).join(good);
-  // remove o caractere de substituição (�) usado quando o acento se perdeu
-  t=t.replace(/\uFFFD/g,'');
-  return t.trim();
-}
+  /* Dropzone */
+  .drop{border:2px dashed var(--line);border-radius:var(--radius);padding:34px;
+    text-align:center;background:var(--panel);transition:.2s;cursor:pointer}
+  .drop:hover,.drop.hot{border-color:var(--accent);background:var(--panel2)}
+  .drop h2{margin:0 0 6px;font-size:16px}
+  .drop p{margin:4px 0;color:var(--muted)}
+  .drop .big{font-size:40px;margin-bottom:6px}
 
-/* ---------- detecção flexível de colunas ---------- */
-// mapeia o cabeçalho real -> campos canônicos (tolerante a acento/caixa)
-const FIELD_ALIASES = {
-  nome:['nome','name'],
-  email:['email','e-mail'],
-  emailConfirmado:['emailconfirmado','email confirmado'],
-  celular:['celular','telefone','phone'],
-  cidade:['cidade','city'],
-  estado:['estado','uf','state'],
-  comoConheceu:['comoconheceu','como conheceu','origem','fonte'],
-  dataCadastro:['datacadastro','data cadastro','data de cadastro','cadastro'],
-  qtdLogin:['qtdlogin','qtd login','logins','quantidade login','qtd de login'],
-  ultimoAcesso:['ultimoacesso','ultimo acesso','último acesso'],
-  qtdLaudos:['qtdlaudos','qtd laudos','laudos','quantidade laudos','qtd de laudos'],
-  dataPrimeiroLaudo:['dataprimeirolaudo','data primeiro laudo','primeiro laudo'],
-  tipoAssinatura:['tipoassinatura','tipo assinatura','tipo','assinatura','plano'],
-  dataAssinatura:['dataassinatura','data assinatura','data de assinatura'],
-  dataCancelamento:['datacancelamento','data cancelamento','data de cancelamento','cancelamento'],
-};
-const norm = s => String(s||'').trim().toLowerCase()
-  .normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  .toolbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:18px 0}
+  .toolbar .chip{background:var(--panel2);border:1px solid var(--line);
+    padding:8px 12px;border-radius:10px;color:var(--muted);font-size:12.5px}
+  .toolbar .chip b{color:var(--txt)}
+  select,button{font-family:inherit;font-size:13px}
+  select{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    padding:9px 12px;border-radius:10px;cursor:pointer}
+  label.switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;color:var(--muted)}
+  label.switch input{width:16px;height:16px;accent-color:var(--accent)}
+  button.ghost{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    padding:9px 14px;border-radius:10px;cursor:pointer}
+  button.ghost:hover{border-color:var(--accent)}
 
-function buildColumnMap(headers){
-  const map={}; const missing=[];
-  for(const [field,aliases] of Object.entries(FIELD_ALIASES)){
-    const hit = headers.find(h=> aliases.includes(norm(h)));
-    if(hit) map[field]=hit; else missing.push(field);
-  }
-  return {map,missing};
-}
+  /* KPI cards */
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin-bottom:8px}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px 18px;box-shadow:var(--shadow)}
+  .kpi .lab{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.6px}
+  .kpi .val{font-size:30px;font-weight:800;margin-top:6px}
+  .kpi .hint{font-size:12px;color:var(--muted);margin-top:4px}
+  .kpi.accent .val{color:var(--accent)}
+  .kpi.green .val{color:var(--accent2)}
+  .kpi.warn .val{color:var(--warn)}
+  .kpi.danger .val{color:var(--danger)}
+  .kpi.purple .val{color:var(--purple)}
 
-/* ---------- classificação do tipo (estado atual) ---------- */
-// normaliza para: assinante | gratuito | exassinante | cortesia | outro
-function classify(tipoRaw){
-  const t=norm(tipoRaw);
-  if(t.startsWith('ex')) return 'exassinante';   // "ex-assinante"
-  if(t.startsWith('assin')) return 'assinante';
-  if(t.startsWith('grat')) return 'gratuito';
-  if(t.startsWith('cortes')) return 'cortesia';
-  return 'outro';
-}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;margin-top:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px 18px;box-shadow:var(--shadow)}
+  .card h3{margin:0 0 2px;font-size:14.5px}
+  .card .csub{color:var(--muted);font-size:12px;margin-bottom:12px}
+  .col-12{grid-column:span 12}.col-8{grid-column:span 8}.col-6{grid-column:span 6}
+  .col-4{grid-column:span 4}.col-5{grid-column:span 5}.col-7{grid-column:span 7}
+  @media(max-width:1000px){[class^=col-]{grid-column:span 12}}
+  canvas{max-height:300px}
 
-/* ---------- heurística de registro de teste/lixo ---------- */
-const TEST_EMAIL_DOMAINS = ['mailinator','uorak','tempmail','teste','example',
-  'yopmail','guerrilla','sharklasers','niekie','revutap','obxstorm','relumyx',
-  'ckuer','gixpos','ptiong','kobace','niprack','hazhab','him6','gopicta','nalwan',
-  'jxbav','fidhost','daugr','jalunaki','maazios','gamepec','pamaweb','gpipes',
-  'inkmoto','steamoh','viemery','conca','abowned','art2mart','hebase','marvetos',
-  'bittnex','fenxz','lidugw','hutdot','etramay','draughtier','certve','bizmud',
-  'hopesx','cadebek','rograc','nuitx','prodbits','soppat','agiuse','him6','jucatyo'];
-function looksTest(r){
-  const nome=norm(r.nome), email=String(r.email||'').toLowerCase();
-  if(!nome) return true;
-  // nomes claramente de teste
-  if(/^(teste|test|aaa+|xxx+|abc|asd|dfg|qwe|fulano|ciclano|beltrano|zzz|ddd|eee|www|kkk|nome)/.test(nome)) return true;
-  if(/teste/.test(nome)) return true;
-  // nome com caractere repetido longo (ex: "aaaaaaa")
-  if(/(.)\1{5,}/.test(nome.replace(/\s/g,''))) return true;
-  // domínios descartáveis
-  const dom=email.split('@')[1]||'';
-  if(TEST_EMAIL_DOMAINS.some(d=>dom.includes(d))) return true;
-  // email sem @
-  if(email && !email.includes('@')) return true;
-  return false;
-}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:var(--panel2)}
+  .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11.5px;font-weight:600}
+  .b-ass{background:rgba(43,212,167,.15);color:var(--accent2)}
+  .b-gra{background:rgba(79,140,255,.15);color:var(--accent)}
+  .b-ex{background:rgba(255,93,108,.15);color:var(--danger)}
+  .b-cor{background:rgba(169,139,255,.15);color:var(--purple)}
 
-/* ---------- normalização de uma linha ---------- */
-function normalizeRow(raw, cmap){
-  const g = f => cmap[f]!==undefined ? raw[cmap[f]] : undefined;
-  const dCad=parseDate(g('dataCadastro'));
-  const dAss=parseDate(g('dataAssinatura'));
-  const dCanc=parseDate(g('dataCancelamento'));
-  const dLaudo=parseDate(g('dataPrimeiroLaudo'));
-  const dAcesso=parseDate(g('ultimoAcesso'));
-  const r={
-    nome:fixText(g('nome')), email:g('email'),
-    estado:(fixText(g('estado')).toUpperCase()||'—'),
-    cidade:fixText(g('cidade')),
-    origem:(fixText(g('comoConheceu'))||'—'),
-    qtdLogin:+(g('qtdLogin')||0)||0,
-    qtdLaudos:+(g('qtdLaudos')||0)||0,
-    dataCadastro:dCad, dataAssinatura:dAss, dataCancelamento:dCanc,
-    dataPrimeiroLaudo:dLaudo, ultimoAcesso:dAcesso,
-    tipo:classify(g('tipoAssinatura')),
-    tipoRaw:String(g('tipoAssinatura')||'').trim(),
-    diasAteAssinatura: daysBetween(dCad,dAss),
-    diasAtePrimeiroLaudo: daysBetween(dCad,dLaudo),
-  };
-  r.isTest=looksTest(r);
-  return r;
-}
+  .hidden{display:none!important}
+  .foot{color:var(--muted);font-size:12px;text-align:center;padding:24px;border-top:1px solid var(--line);margin-top:30px}
+  .pill{font-size:11px;padding:3px 8px;border-radius:20px;background:var(--panel2);border:1px solid var(--line);color:var(--muted)}
+  .warnbox{background:rgba(255,176,32,.08);border:1px solid rgba(255,176,32,.3);
+    color:#ffd27a;padding:10px 14px;border-radius:10px;font-size:12.5px;margin-top:12px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1><span>nReport</span> • Painel de Métricas de Usuários</h1>
+    <div class="sub">100% local no seu navegador — nenhum dado é enviado para servidores. 🔒 (LGPD)</div>
+  </div>
+  <div class="pill" id="statusPill">Aguardando planilha…</div>
+</header>
 
-/* ============================================================
-   LEITURA DE ARQUIVO
-   ============================================================ */
-function handleFile(file){
-  const reader=new FileReader();
-  reader.onload=e=>{
-    try{
-      const data=new Uint8Array(e.target.result);
-      const wb=XLSX.read(data,{type:'array',cellDates:true,raw:false});
-      const ws=wb.Sheets[wb.SheetNames[0]];
-      const json=XLSX.utils.sheet_to_json(ws,{defval:'',raw:false});
-      if(!json.length){ alert('A planilha parece vazia.'); return; }
-      const headers=Object.keys(json[0]);
-      const {map,missing}=buildColumnMap(headers);
-      if(map.dataCadastro===undefined || map.tipoAssinatura===undefined){
-        alert('Não encontrei as colunas essenciais (DataCadastro e TipoAssinatura). Verifique o cabeçalho.');
-        return;
-      }
-      RAW=json;
-      ROWS=json.map(r=>normalizeRow(r,map));
-      showMappingWarning(missing);
-      initApp();
-    }catch(err){ console.error(err); alert('Erro ao ler o arquivo: '+err.message); }
-  };
-  reader.readAsArrayBuffer(file);
-}
+<div class="wrap">
 
-function showMappingWarning(missing){
-  const box=document.getElementById('mapWarn');
-  const relevant=missing.filter(m=>['dataPrimeiroLaudo','dataAssinatura','dataCancelamento','qtdLaudos','comoConheceu','estado'].includes(m));
-  if(relevant.length){
-    box.classList.remove('hidden');
-    box.innerHTML='⚠️ Colunas não encontradas (alguns gráficos ficam limitados): <b>'+relevant.join(', ')+'</b>';
-  }else box.classList.add('hidden');
-}
+  <!-- UPLOAD -->
+  <div id="dropArea" class="drop">
+    <div class="big">📊</div>
+    <h2>Arraste a planilha aqui, ou clique para selecionar</h2>
+    <p>Aceita <b>.xlsx</b> e <b>.csv</b> (separador <code>;</code> ou <code>,</code>)</p>
+    <p style="font-size:12px">A leitura acontece inteiramente no seu computador.</p>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" class="hidden">
+  </div>
 
-/* ============================================================
-   DADOS FILTRADOS
-   ============================================================ */
-function currentData(){
-  const hideTest=document.getElementById('chkFilterTest').checked;
-  return hideTest ? ROWS.filter(r=>!r.isTest) : ROWS;
-}
+  <div id="mapWarn" class="warnbox hidden"></div>
 
-/* ============================================================
-   INICIALIZAÇÃO DO APP
-   ============================================================ */
-function initApp(){
-  document.getElementById('dropArea').classList.add('hidden');
-  document.getElementById('app').classList.remove('hidden');
-  document.getElementById('statusPill').textContent='Planilha carregada ✓';
-  buildMonthSelector();
-  renderAll();
-  renderSnapshots();
-}
+  <!-- APP -->
+  <div id="app" class="hidden">
 
-function buildMonthSelector(){
-  const data=currentData();
-  const months=[...new Set(data.map(r=>ymKey(r.dataCadastro)).filter(Boolean))].sort().reverse();
-  const sel=document.getElementById('selMonth');
-  sel.innerHTML=months.map(m=>`<option value="${m}">${ymLabel(m)}</option>`).join('');
-}
+    <div class="toolbar">
+      <div class="chip">Registros válidos: <b id="chTotal">0</b></div>
+      <div class="chip">Período: <b id="chRange">—</b></div>
+      <label class="switch"><input type="checkbox" id="chkFilterTest" checked>
+        Ocultar cadastros de teste/lixo (<span id="chTest">0</span>)</label>
+      <div style="flex:1"></div>
+      <button class="ghost" id="btnSnap">💾 Salvar snapshot do dia</button>
+      <button class="ghost" id="btnReset">↻ Trocar planilha</button>
+    </div>
 
-function renderAll(){
-  const data=currentData();
-  // chips
-  document.getElementById('chTotal').textContent=fmt(data.length);
-  document.getElementById('chTest').textContent=fmt(ROWS.filter(r=>r.isTest).length);
-  const cadDates=data.map(r=>r.dataCadastro).filter(Boolean).sort((a,b)=>a-b);
-  document.getElementById('chRange').textContent=cadDates.length
-    ? `${cadDates[0].toLocaleDateString('pt-BR')} → ${cadDates[cadDates.length-1].toLocaleDateString('pt-BR')}` : '—';
+    <!-- KPIs -->
+    <div class="kpis">
+      <div class="kpi green"><div class="lab">Assinantes ativos</div>
+        <div class="val" id="kAss">0</div><div class="hint" id="kAssPct">—</div></div>
+      <div class="kpi accent"><div class="lab">Gratuitos</div>
+        <div class="val" id="kGra">0</div><div class="hint" id="kGraPct">—</div></div>
+      <div class="kpi danger"><div class="lab">Ex-assinantes</div>
+        <div class="val" id="kEx">0</div><div class="hint" id="kExPct">—</div></div>
+      <div class="kpi purple"><div class="lab">Cortesia</div>
+        <div class="val" id="kCor">0</div><div class="hint" id="kCorPct">—</div></div>
+      <div class="kpi"><div class="lab">Total de usuários</div>
+        <div class="val" id="kTot">0</div><div class="hint">base inteira</div></div>
+      <div class="kpi warn"><div class="lab">Tempo médio p/ assinar</div>
+        <div class="val" id="kConv">—</div><div class="hint">cadastro → assinatura</div></div>
+    </div>
 
-  renderKPIs(data);
-  renderGrowth(data);
-  renderSubCanc(data);
-  renderSource(data);
-  renderState(data);
-  renderReports(data);
-  renderMonth();
-}
+    <!-- Seletor de mês -->
+    <div class="toolbar">
+      <strong style="font-size:14px">Fechamento mensal</strong>
+      <select id="selMonth"></select>
+      <span class="chip" id="monthHint"></span>
+    </div>
 
-/* ---------- KPIs gerais (estado atual) ---------- */
-function renderKPIs(data){
-  const total=data.length;
-  const c={assinante:0,gratuito:0,exassinante:0,cortesia:0,outro:0};
-  data.forEach(r=>c[r.tipo]++);
-  const pct=n=> total? (100*n/total).toFixed(1)+'% da base':'—';
-  document.getElementById('kAss').textContent=fmt(c.assinante);
-  document.getElementById('kAssPct').textContent=pct(c.assinante);
-  document.getElementById('kGra').textContent=fmt(c.gratuito);
-  document.getElementById('kGraPct').textContent=pct(c.gratuito);
-  document.getElementById('kEx').textContent=fmt(c.exassinante);
-  document.getElementById('kExPct').textContent=pct(c.exassinante);
-  document.getElementById('kCor').textContent=fmt(c.cortesia);
-  document.getElementById('kCorPct').textContent=pct(c.cortesia);
-  document.getElementById('kTot').textContent=fmt(total);
+    <div class="kpis">
+      <div class="kpi accent"><div class="lab">Novos cadastros no mês</div>
+        <div class="val" id="mNew">0</div><div class="hint">por DataCadastro</div></div>
+      <div class="kpi green"><div class="lab">Novas assinaturas no mês</div>
+        <div class="val" id="mSub">0</div><div class="hint">por DataAssinatura</div></div>
+      <div class="kpi danger"><div class="lab">Cancelamentos no mês</div>
+        <div class="val" id="mCanc">0</div><div class="hint">por DataCancelamento</div></div>
+      <div class="kpi warn"><div class="lab">Taxa de ativação</div>
+        <div class="val" id="mAct">—</div><div class="hint">cadastrados que fizeram ≥1 laudo</div></div>
+    </div>
 
-  // tempo médio cadastro -> assinatura (quem tem as duas datas)
-  const difs=data.map(r=>r.diasAteAssinatura).filter(d=>d!=null && d>=0);
-  const avg= difs.length? Math.round(difs.reduce((a,b)=>a+b,0)/difs.length) : null;
-  document.getElementById('kConv').textContent= avg!=null? avg+' dias' : '—';
-}
+    <!-- Comportamento dos gratuitos no mês -->
+    <div class="grid">
+      <div class="card col-5">
+        <h3>Comportamento dos novos gratuitos no mês</h3>
+        <div class="csub" id="freeMonthSub">—</div>
+        <canvas id="chartFreeBehavior"></canvas>
+      </div>
+      <div class="card col-7">
+        <h3>Curva de crescimento — cadastros por mês</h3>
+        <div class="csub">Novos usuários a cada mês (por DataCadastro)</div>
+        <canvas id="chartGrowth"></canvas>
+      </div>
+    </div>
 
-/* ---------- gráfico: crescimento (cadastros/mês) ---------- */
-function renderGrowth(data){
-  const byMonth={};
-  data.forEach(r=>{const k=ymKey(r.dataCadastro); if(k) byMonth[k]=(byMonth[k]||0)+1;});
-  const keys=Object.keys(byMonth).sort();
-  drawChart('chartGrowth','line',{
-    labels:keys.map(ymLabel),
-    datasets:[{label:'Novos cadastros',data:keys.map(k=>byMonth[k]),
-      borderColor:'#4f8cff',backgroundColor:'rgba(79,140,255,.15)',fill:true,tension:.3,pointRadius:2}]
-  });
-}
+    <div class="grid">
+      <div class="card col-7">
+        <h3>Composição da base por mês</h3>
+        <div class="csub">Assinaturas vs. cancelamentos (eventos por mês)</div>
+        <canvas id="chartSubCanc"></canvas>
+      </div>
+      <div class="card col-5">
+        <h3>Origem dos usuários (ComoConheceu)</h3>
+        <div class="csub">Distribuição de toda a base filtrada</div>
+        <canvas id="chartSource"></canvas>
+      </div>
+    </div>
 
-/* ---------- gráfico: assinaturas vs cancelamentos por mês ---------- */
-function renderSubCanc(data){
-  const sub={},canc={};
-  data.forEach(r=>{
-    const ks=ymKey(r.dataAssinatura); if(ks) sub[ks]=(sub[ks]||0)+1;
-    const kc=ymKey(r.dataCancelamento); if(kc) canc[kc]=(canc[kc]||0)+1;
-  });
-  const keys=[...new Set([...Object.keys(sub),...Object.keys(canc)])].sort();
-  drawChart('chartSubCanc','bar',{
-    labels:keys.map(ymLabel),
-    datasets:[
-      {label:'Novas assinaturas',data:keys.map(k=>sub[k]||0),backgroundColor:'#2bd4a7'},
-      {label:'Cancelamentos',data:keys.map(k=>canc[k]||0),backgroundColor:'#ff5d6c'}
-    ]
-  });
-}
+    <div class="grid">
+      <div class="card col-6">
+        <h3>Top estados</h3>
+        <div class="csub">Usuários por UF</div>
+        <canvas id="chartState"></canvas>
+      </div>
+      <div class="card col-6">
+        <h3>Faixas de laudos emitidos</h3>
+        <div class="csub">Distribuição de QtdLaudos (base filtrada)</div>
+        <canvas id="chartReports"></canvas>
+      </div>
+    </div>
 
-/* ---------- gráfico: origem ---------- */
-function renderSource(data){
-  const by={};
-  data.forEach(r=>{const o=r.origem||'—'; by[o]=(by[o]||0)+1;});
-  const entries=Object.entries(by).sort((a,b)=>b[1]-a[1]);
-  drawChart('chartSource','doughnut',{
-    labels:entries.map(e=>e[0]),
-    datasets:[{data:entries.map(e=>e[1]),
-      backgroundColor:['#4f8cff','#2bd4a7','#ffb020','#a98bff','#ff5d6c','#5ad1e6','#f78fb3','#8c9bb5','#c9d1e0']}]
-  },{plugins:{legend:{position:'right',labels:{color:'#9aa7bd',font:{size:11}}}}});
-}
+    <!-- Snapshots -->
+    <div class="grid">
+      <div class="card col-12">
+        <h3>Histórico de snapshots mensais</h3>
+        <div class="csub">Fotos agregadas salvas no seu navegador (IndexedDB). Sem dados pessoais — só números.</div>
+        <table id="snapTable">
+          <thead><tr>
+            <th>Data do snapshot</th><th class="num">Assinantes</th><th class="num">Gratuitos</th>
+            <th class="num">Ex-assinantes</th><th class="num">Cortesia</th><th class="num">Total</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+        <p id="noSnap" class="csub" style="margin-top:10px">Nenhum snapshot salvo ainda.</p>
+      </div>
+    </div>
 
-/* ---------- gráfico: estados ---------- */
-function renderState(data){
-  const by={};
-  data.forEach(r=>{const s=r.estado||'—'; by[s]=(by[s]||0)+1;});
-  const entries=Object.entries(by).sort((a,b)=>b[1]-a[1]).slice(0,12);
-  drawChart('chartState','bar',{
-    labels:entries.map(e=>e[0]),
-    datasets:[{label:'Usuários',data:entries.map(e=>e[1]),backgroundColor:'#4f8cff'}]
-  },{indexAxis:'y'});
-}
+  </div><!-- /app -->
 
-/* ---------- gráfico: faixas de laudos ---------- */
-function reportBucket(n){
-  if(n<=0) return '0 laudos';
-  if(n<=10) return '1–10';
-  if(n<=50) return '11–50';
-  if(n<=200) return '51–200';
-  return '200+';
-}
-function renderReports(data){
-  const order=['0 laudos','1–10','11–50','51–200','200+'];
-  const by={}; order.forEach(o=>by[o]=0);
-  data.forEach(r=>by[reportBucket(r.qtdLaudos)]++);
-  drawChart('chartReports','bar',{
-    labels:order,
-    datasets:[{label:'Usuários',data:order.map(o=>by[o]),
-      backgroundColor:['#8c9bb5','#4f8cff','#2bd4a7','#ffb020','#a98bff']}]
-  },{plugins:{legend:{display:false}}});
-}
+</div>
 
-/* ---------- fechamento mensal ---------- */
-function renderMonth(){
-  const data=currentData();
-  const mk=document.getElementById('selMonth').value;
-  if(!mk) return;
+<div class="foot">
+  nReport Dashboard • roda offline no navegador • dados sensíveis nunca saem da sua máquina.
+</div>
 
-  const novos=data.filter(r=>ymKey(r.dataCadastro)===mk);
-  const assinaturas=data.filter(r=>ymKey(r.dataAssinatura)===mk);
-  const cancels=data.filter(r=>ymKey(r.dataCancelamento)===mk);
-
-  document.getElementById('mNew').textContent=fmt(novos.length);
-  document.getElementById('mSub').textContent=fmt(assinaturas.length);
-  document.getElementById('mCanc').textContent=fmt(cancels.length);
-
-  // taxa de ativação: dos novos, quantos fizeram >=1 laudo
-  const ativados=novos.filter(r=>r.qtdLaudos>0).length;
-  document.getElementById('mAct').textContent= novos.length
-    ? (100*ativados/novos.length).toFixed(0)+'%' : '—';
-
-  document.getElementById('monthHint').textContent=
-    `${novos.length} novos cadastros em ${ymLabel(mk)}`;
-
-  // comportamento dos novos gratuitos do mês (foco do pedido original)
-  const gratuitosDoMes=novos.filter(r=>r.tipo==='gratuito');
-  const semLaudo=gratuitosDoMes.filter(r=>r.qtdLaudos===0).length;
-  const ate10=gratuitosDoMes.filter(r=>r.qtdLaudos>=1&&r.qtdLaudos<=10).length;
-  const mais10=gratuitosDoMes.filter(r=>r.qtdLaudos>10).length;
-
-  document.getElementById('freeMonthSub').textContent=
-    `${gratuitosDoMes.length} gratuitos cadastrados em ${ymLabel(mk)}`;
-
-  drawChart('chartFreeBehavior','doughnut',{
-    labels:['Nenhum laudo','1–10 laudos','Mais de 10 laudos'],
-    datasets:[{data:[semLaudo,ate10,mais10],
-      backgroundColor:['#ff5d6c','#4f8cff','#2bd4a7']}]
-  },{plugins:{legend:{position:'bottom',labels:{color:'#9aa7bd',font:{size:11}}}}});
-}
-
-/* ---------- helper Chart.js ---------- */
-function drawChart(id,type,data,extra={}){
-  const ctx=document.getElementById(id).getContext('2d');
-  if(CHARTS[id]) CHARTS[id].destroy();
-  const base={
-    responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{labels:{color:'#9aa7bd'}}},
-    scales:(type==='doughnut'||type==='pie')?{}:{
-      x:{ticks:{color:'#9aa7bd',font:{size:11}},grid:{color:'rgba(255,255,255,.04)'}},
-      y:{ticks:{color:'#9aa7bd'},grid:{color:'rgba(255,255,255,.04)'}}
-    }
-  };
-  // merge raso
-  const opts={...base,...extra,plugins:{...base.plugins,...(extra.plugins||{})},
-    scales:extra.scales||base.scales};
-  CHARTS[id]=new Chart(ctx,{type,data,options:opts});
-}
-
-/* ============================================================
-   SNAPSHOTS (IndexedDB) — só agregados, sem dados pessoais
-   ============================================================ */
-const DB_NAME='nreport_snapshots', STORE='snaps';
-function openDB(){
-  return new Promise((res,rej)=>{
-    const req=indexedDB.open(DB_NAME,1);
-    req.onupgradeneeded=()=>req.result.createObjectStore(STORE,{keyPath:'id'});
-    req.onsuccess=()=>res(req.result);
-    req.onerror=()=>rej(req.error);
-  });
-}
-async function saveSnapshot(){
-  const data=currentData();
-  const c={assinante:0,gratuito:0,exassinante:0,cortesia:0};
-  data.forEach(r=>{if(c[r.tipo]!==undefined)c[r.tipo]++;});
-  const snap={
-    id:new Date().toISOString().slice(0,10), // 1 por dia (último do dia vence)
-    data:new Date().toISOString(),
-    assinante:c.assinante,gratuito:c.gratuito,
-    exassinante:c.exassinante,cortesia:c.cortesia,total:data.length
-  };
-  const db=await openDB();
-  await new Promise((res,rej)=>{
-    const tx=db.transaction(STORE,'readwrite');
-    tx.objectStore(STORE).put(snap);
-    tx.oncomplete=res; tx.onerror=()=>rej(tx.error);
-  });
-  renderSnapshots();
-  document.getElementById('statusPill').textContent='Snapshot salvo ✓';
-}
-async function getSnapshots(){
-  const db=await openDB();
-  return new Promise((res,rej)=>{
-    const tx=db.transaction(STORE,'readonly');
-    const req=tx.objectStore(STORE).getAll();
-    req.onsuccess=()=>res(req.result.sort((a,b)=>b.id.localeCompare(a.id)));
-    req.onerror=()=>rej(req.error);
-  });
-}
-async function deleteSnapshot(id){
-  const db=await openDB();
-  await new Promise(res=>{
-    const tx=db.transaction(STORE,'readwrite');
-    tx.objectStore(STORE).delete(id); tx.oncomplete=res;
-  });
-  renderSnapshots();
-}
-async function renderSnapshots(){
-  const snaps=await getSnapshots();
-  const tb=document.querySelector('#snapTable tbody');
-  const no=document.getElementById('noSnap');
-  if(!snaps.length){ tb.innerHTML=''; no.classList.remove('hidden'); return; }
-  no.classList.add('hidden');
-  tb.innerHTML=snaps.map(s=>`<tr>
-    <td>${new Date(s.id).toLocaleDateString('pt-BR')}</td>
-    <td class="num">${fmt(s.assinante)}</td>
-    <td class="num">${fmt(s.gratuito)}</td>
-    <td class="num">${fmt(s.exassinante)}</td>
-    <td class="num">${fmt(s.cortesia)}</td>
-    <td class="num"><b>${fmt(s.total)}</b></td>
-    <td class="num"><button class="ghost" data-del="${s.id}" style="padding:4px 8px">🗑</button></td>
-  </tr>`).join('');
-  tb.querySelectorAll('[data-del]').forEach(b=>
-    b.onclick=()=>deleteSnapshot(b.getAttribute('data-del')));
-}
-
-/* ============================================================
-   EVENTOS DE UI
-   ============================================================ */
-const drop=document.getElementById('dropArea');
-const input=document.getElementById('fileInput');
-drop.onclick=()=>input.click();
-input.onchange=e=>{ if(e.target.files[0]) handleFile(e.target.files[0]); };
-['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{
-  e.preventDefault();drop.classList.add('hot');}));
-['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{
-  e.preventDefault();drop.classList.remove('hot');}));
-drop.addEventListener('drop',e=>{ if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
-
-document.getElementById('chkFilterTest').onchange=()=>{buildMonthSelector();renderAll();};
-document.getElementById('selMonth').onchange=renderMonth;
-document.getElementById('btnSnap').onclick=saveSnapshot;
-document.getElementById('btnReset').onclick=()=>{
-  RAW=[];ROWS=[];
-  document.getElementById('app').classList.add('hidden');
-  document.getElementById('dropArea').classList.remove('hidden');
-  document.getElementById('mapWarn').classList.add('hidden');
-  document.getElementById('statusPill').textContent='Aguardando planilha…';
-  input.value='';
-};
+<script src="app.js"></script>
+</body>
+</html>
